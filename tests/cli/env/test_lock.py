@@ -4,6 +4,7 @@ import pytest
 import tomli_w
 
 from hatch.config.constants import ConfigEnvVars
+from hatch.env.lockers.uv import UvLocker
 from hatch.project.core import Project
 from hatch.utils.toml import load_toml_file
 
@@ -372,6 +373,64 @@ def test_check_exists(hatch, helpers, temp_dir, config_file):
     assert "Lockfile is up to date" in result.output
 
 
+def test_uv_in_sync_identical_content(helpers, monkeypatch, temp_dir):
+    lock_path = temp_dir / "pylock.toml"
+    lock_body = helpers.dedent(
+        """
+        lock-version = "1.0"
+        created-by = "uv"
+
+        [[packages]]
+        name = "click"
+        version = "8.4.1"
+        """
+    )
+    lock_path.write_text(lock_body, encoding="utf-8")
+
+    def generate(_cls, _environment, _dependencies, output_path, **_kwargs):
+        output_path.write_text(lock_body, encoding="utf-8")
+
+    monkeypatch.setattr(UvLocker, "generate", classmethod(generate))
+
+    assert UvLocker.in_sync(object(), [], lock_path)
+
+
+def test_uv_in_sync_different_content(helpers, monkeypatch, temp_dir):
+    lock_path = temp_dir / "pylock.toml"
+    lock_path.write_text(
+        helpers.dedent(
+            """
+            lock-version = "1.0"
+            created-by = "uv"
+
+            [[packages]]
+            name = "click"
+            version = "8.4.1"
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    def generate(_cls, _environment, _dependencies, output_path, **_kwargs):
+        output_path.write_text(
+            helpers.dedent(
+                """
+                lock-version = "1.0"
+                created-by = "uv"
+
+                [[packages]]
+                name = "click"
+                version = "8.5.0"
+                """
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(UvLocker, "generate", classmethod(generate))
+
+    assert not UvLocker.in_sync(object(), [], lock_path)
+
+
 @pytest.mark.usefixtures("mock_locker")
 def test_check_lockfile_stale(hatch, helpers, temp_dir, config_file):
     config_file.model.template.plugins["default"]["tests"] = False
@@ -525,6 +584,69 @@ def test_custom_lock_filename(hatch, helpers, temp_dir, config_file):
 
     assert result.exit_code == 0, result.output
     assert f"Wrote lockfile: {project_path / 'locks' / 'default.toml'}" in result.output
+
+
+@pytest.mark.usefixtures("mock_locker")
+def test_custom_lock_filename_with_context_formatting(hatch, helpers, temp_dir, config_file):
+    config_file.model.template.plugins["default"]["tests"] = False
+    config_file.save()
+
+    project_name = "My.App"
+
+    with temp_dir.as_cwd():
+        result = hatch("new", project_name)
+
+    assert result.exit_code == 0, result.output
+
+    project_path = temp_dir / "my-app"
+    data_path = temp_dir / "data"
+    data_path.mkdir()
+
+    project = Project(project_path)
+    helpers.update_project_environment(
+        project,
+        "default",
+        {
+            "skip-install": True,
+            "dependencies": ["requests"],
+            "locked": True,
+            "lock-filename": "pylock.{env_name}.toml",
+            **project.config.envs["default"],
+        },
+    )
+    helpers.update_project_environment(
+        project,
+        "test1",
+        {
+            "locked": True,
+            "lock-filename": "locks/{env_name}/pylock.toml",
+        },
+    )
+    helpers.update_project_environment(
+        project,
+        "test2",
+        {
+            "locked": True,
+        },
+    )
+
+    with project_path.as_cwd(env_vars={ConfigEnvVars.DATA: str(data_path)}):
+        result = hatch("env", "lock", "default")
+
+    assert result.exit_code == 0, result.output
+    assert f"Wrote lockfile: {project_path / 'pylock.default.toml'}" in result.output
+
+    with project_path.as_cwd(env_vars={ConfigEnvVars.DATA: str(data_path)}):
+        result = hatch("env", "lock", "test1")
+
+    assert result.exit_code == 0, result.output
+    assert f"Wrote lockfile: {project_path / 'locks' / 'test1' / 'pylock.toml'}" in result.output
+
+    with project_path.as_cwd(env_vars={ConfigEnvVars.DATA: str(data_path)}):
+        result = hatch("env", "lock", "test2")
+
+    assert result.exit_code == 0, result.output
+    assert f"Wrote lockfile: {project_path / 'pylock.test2.toml'}" in result.output
 
 
 @pytest.mark.usefixtures("mock_locker")
@@ -834,7 +956,7 @@ def test_lock_writes_one_lockfile_per_environment(hatch, helpers, temp_dir, conf
     helpers.update_project_environment(
         project,
         "default",
-        {**base, "installer": "uv", "skip-install": True, "locked": True, "dependencies": ["httpx"]},
+        {**base, "installer": "uv", "skip-install": True, "locked": True, "dependencies": ["httpx2"]},
     )
     helpers.update_project_environment(
         project,
@@ -861,7 +983,7 @@ def test_lock_writes_one_lockfile_per_environment(hatch, helpers, temp_dir, conf
     assert lock_api.is_file()
     assert lock_worker.is_file()
 
-    assert "httpx" in lock_default.read_text(encoding="utf-8").lower()
+    assert "httpx2" in lock_default.read_text(encoding="utf-8").lower()
     assert "click" in lock_api.read_text(encoding="utf-8").lower()
     assert "rich" in lock_worker.read_text(encoding="utf-8").lower()
 
@@ -1035,7 +1157,7 @@ def test_lock_export_paths_use_same_names_as_export_all(hatch, helpers, temp_dir
     helpers.update_project_environment(
         project,
         "default",
-        {**base, "installer": "uv", "skip-install": True, "locked": True, "dependencies": ["httpx"]},
+        {**base, "installer": "uv", "skip-install": True, "locked": True, "dependencies": ["httpx2"]},
     )
     helpers.update_project_environment(
         project,
@@ -1056,7 +1178,7 @@ def test_lock_export_paths_use_same_names_as_export_all(hatch, helpers, temp_dir
     assert r_sidecar.exit_code == 0, r_sidecar.output
     assert exp_default.is_file()
     assert exp_sidecar.is_file()
-    assert "httpx" in exp_default.read_text(encoding="utf-8").lower()
+    assert "httpx2" in exp_default.read_text(encoding="utf-8").lower()
     assert "click" in exp_sidecar.read_text(encoding="utf-8").lower()
 
 
